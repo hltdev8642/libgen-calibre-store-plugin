@@ -40,7 +40,7 @@ from calibre.gui2.store.basic_config import BasicStoreConfig
 from calibre.gui2.store.search_result import SearchResult
 from calibre.gui2.store.web_store_dialog import WebStoreDialog
 from calibre.utils.browser import Browser
-from urllib.request import urlopen
+from urllib.request import urlopen, Request as URLRequest
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -249,16 +249,11 @@ def _build_libgen_result(tr):
 
     s.drm = SearchResult.DRM_UNLOCKED
 
-    # Cover image — FIX: use _safe_image_url() instead of naive concatenation.
-    # The previous ``libgen_url + image_src`` produced malformed URLs when
-    # image_src was already absolute, leading to the NotImage error.
-    try:
-        img = tds[image_index].find("img")
-        src = (img.get("src") or img.get("data-src")) if img else None
-        s.cover_url = _safe_image_url(libgen_url, src)
-    except Exception:
-        logger.debug("LibGen: could not extract cover src; skipping cover.")
-        s.cover_url = None
+    # LibGen's cover CDN frequently returns HTML 404 pages for missing covers
+    # (no per-request content-type checking is possible without an extra HTTP
+    # round-trip). Setting cover_url = None lets Calibre show a placeholder
+    # icon instead of raising NotImage in download_thread.py.
+    s.cover_url = None
 
     return s
 
@@ -331,14 +326,16 @@ def _get_details_libgen(s, retries=3):
 
 def _zlib_api_request(url, payload=None):
     """POST (or GET) a Z-Library eAPI endpoint and return the parsed JSON."""
-    data = urllib.parse.urlencode(payload).encode("utf-8") if payload else None
-    br = Browser()
-    br.set_handle_robots(False)
-    br.set_user_agent(USER_AGENT)
-    if data:
-        br.set_current_header("content-type", "application/x-www-form-urlencoded")
-    response = br.open(url, data=data).read()
-    return json.loads(response)
+    if payload:
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+        req = URLRequest(url, data=data, headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": USER_AGENT,
+        })
+    else:
+        req = URLRequest(url, headers={"User-Agent": USER_AGENT})
+    response = urlopen(req, timeout=30)
+    return json.loads(response.read())
 
 
 def search_zlibrary(query, max_results=10, timeout=60):
@@ -351,8 +348,6 @@ def search_zlibrary(query, max_results=10, timeout=60):
         payload = {
             "message": query,
             "order": "popular",
-            "languages[]": "null",
-            "extensions[]": "null",
         }
         if page > 1:
             payload["page"] = page
