@@ -201,20 +201,20 @@ def extract_indices(soup):
     mirrors_index = indices.get("Mirrors")
 
 
-def _transform_download_url(url):
-    """Convert an /ads... URL into the matching /get.php?md5=... form."""
-    m1 = re.match(r"/ads([a-fA-F0-9]+)", url)
-    if m1:
-        return f"/get.php?md5={m1.group(1)}"
-    m2 = re.match(r"/ads\.php\?md5=([a-fA-F0-9]+)", url)
-    if m2:
-        return f"/get.php?md5={m2.group(1)}"
-    return url
-
-
 def _build_libgen_result(tr):
     """Parse one <tr> row from the LibGen search-results table."""
     tds = tr.find_all("td")
+
+    # Silently skip sparse rows (sub-headers, ad rows, etc.) that lack all
+    # expected columns; those rows are what produce "list index out of range".
+    needed = [
+        title_index, author_index, year_index,
+        pages_index, size_index, ext_index, mirrors_index,
+    ]
+    min_cols = max((i for i in needed if i is not None), default=0) + 1
+    if len(tds) < min_cols:
+        return None
+
     s = SearchResult()
     s.store_name = "LibGen"
 
@@ -240,21 +240,46 @@ def _build_libgen_result(tr):
 
     s.formats = tds[ext_index].text.strip().upper()
 
-    # Detail / download page URL
-    try:
-        first_link = tds[mirrors_index].find("a", href=True)
-        detail = first_link["href"].replace("get.php", "ads.php")
-        s.detail_item = detail if detail.startswith("http") else libgen_url + detail
-    except Exception:
-        s.detail_item = None
+    # Detail page URL — build as {libgen_url}/ads.php?md5={md5} (the canonical
+    # download-info page used by libgen-downloader).  MD5 is extracted from the
+    # first mirror link that carries it, either as ?md5= query param or as a
+    # 32-hex path segment (library.lol: /main/{md5}).
+    detail_url = None
+    if mirrors_index is not None and mirrors_index < len(tds):
+        md5_val = ""
+        for a in tds[mirrors_index].find_all("a", href=True):
+            href = a["href"].strip()
+            parsed_href = urllib.parse.urlparse(href)
+            md5_val = urllib.parse.parse_qs(parsed_href.query).get("md5", [""])[0]
+            if not md5_val:
+                seg = parsed_href.path.rstrip("/").split("/")[-1]
+                if re.match(r'^[0-9a-fA-F]{32}$', seg):
+                    md5_val = seg
+            if md5_val:
+                break
+        if md5_val and libgen_url:
+            detail_url = f"{libgen_url}/ads.php?md5={md5_val}"
+        else:
+            # No MD5 found — fall back to first usable href
+            for a in tds[mirrors_index].find_all("a", href=True):
+                href = a["href"].strip()
+                if href.startswith("http"):
+                    detail_url = href
+                    break
+    s.detail_item = detail_url
 
     s.drm = SearchResult.DRM_UNLOCKED
 
-    # LibGen's cover CDN frequently returns HTML 404 pages for missing covers
-    # (no per-request content-type checking is possible without an extra HTTP
-    # round-trip). Setting cover_url = None lets Calibre show a placeholder
-    # icon instead of raising NotImage in download_thread.py.
-    s.cover_url = None
+    # The search URL requests covers=on, so tds[image_index] (col 0) contains
+    # an <img>.  _safe_image_url enforces an image-extension guard so HTML
+    # error pages returned by LibGen's CDN are rejected before Calibre's
+    # download_thread ever sees them (avoids NotImage errors).
+    cover_url = None
+    if image_index is not None and image_index < len(tds):
+        img = tds[image_index].find("img")
+        if img:
+            cover_url = _safe_image_url(libgen_url, img.get("src", ""))
+    s.cover_url = cover_url
 
     return s
 
@@ -289,7 +314,7 @@ def search_libgen(query, max_results=10, timeout=60):
     for tr in soup.select('table[class="table table-striped"] > tbody > tr'):
         try:
             result = _build_libgen_result(tr)
-            if result.title and result.author:
+            if result and result.title and result.author:
                 results.append(result)
         except Exception as exc:
             logger.error(f"LibGen result parse error: {exc}")
@@ -299,8 +324,36 @@ def search_libgen(query, max_results=10, timeout=60):
     return results[:max_results]
 
 
+def _follow_redirect(url):
+    """Follow HTTP redirects and return the final URL after all hops.
+
+    Sends a Range: bytes=0-0 GET request so the server responds immediately
+    without requiring us to download the full file body.  The final URL (e.g.
+    cdn3.booksdl.lc) is what Calibre receives and can query for Content-Length
+    to show accurate progress in the Jobs window.
+    Falls back to the original URL on any error.
+    """
+    try:
+        req = URLRequest(url, headers={"User-Agent": USER_AGENT, "Range": "bytes=0-0"})
+        resp = urlopen(req, timeout=15)
+        final = resp.geturl()
+        resp.close()
+        return final or url
+    except Exception:
+        return url
+
+
 def _get_details_libgen(s, retries=3):
-    """Fetch the LibGen detail/ads page and extract a direct download URL."""
+    """Fetch the LibGen ads.php page and extract a direct download URL.
+
+    Follows the libgen-downloader approach (LibgenPlusAdapter.getMainDownloadURLFromDocument):
+      1. Fetch {mirror}/ads.php?md5={md5}  (stored as detail_item at search time)
+      2. Primary selector: #main > tr:first-child > td:nth-child(2) > a
+      3. Fallback: any link carrying a one-time key= parameter (library.lol style)
+    """
+    if not s.detail_item:
+        return
+
     br = browser(user_agent=USER_AGENT)
     raw = None
     for _ in range(retries):
@@ -308,17 +361,38 @@ def _get_details_libgen(s, retries=3):
             raw = br.open(s.detail_item, timeout=30).read()
             break
         except Exception:
-            logger.info(f"LibGen detail retry: {s.detail_item}")
+            logger.info(f"LibGen ads page fetch failed, retrying: {s.detail_item}")
             time.sleep(1)
     if not raw:
         return
 
     soup = BeautifulSoup(raw, "html5lib")
-    download_a = soup.select_one("tr a")
-    if download_a:
-        dl_url = download_a.get("href", "")
-        host = urllib.parse.urlparse(s.detail_item).hostname
-        s.downloads[s.formats] = f"https://{host}/{dl_url}"
+    base = s.detail_item
+
+    # Primary: exact CSS path used by libgen-downloader reference implementation
+    dl_link = soup.select_one("#main > tr:first-child > td:nth-child(2) > a")
+    if dl_link:
+        href = dl_link.get("href", "")
+        if href:
+            get_url = urllib.parse.urljoin(base, href)
+            s.downloads[s.formats] = _follow_redirect(get_url)
+            return
+
+    # Fallback: any link carrying a one-time key= parameter (library.lol / get.php style)
+    parsed = urllib.parse.urlparse(base)
+    md5 = urllib.parse.parse_qs(parsed.query).get("md5", [""])[0]
+    if not md5:
+        seg = parsed.path.rstrip("/").split("/")[-1]
+        if re.match(r'^[0-9a-fA-F]{32}$', seg):
+            md5 = seg
+    for a in soup.find_all("a", href=True):
+        full = urllib.parse.urljoin(base, a["href"])
+        key = urllib.parse.parse_qs(urllib.parse.urlparse(full).query).get("key", [""])[0]
+        if key and md5:
+            root = f"{parsed.scheme}://{parsed.netloc}"
+            get_url = f"{root}/get.php?md5={md5}&key={key}"
+            s.downloads[s.formats] = _follow_redirect(get_url)
+            return
 
 
 # ===========================================================================
@@ -397,17 +471,37 @@ def search_zlibrary(query, max_results=10, timeout=60):
 
 
 def _get_details_zlibrary(s):
-    """Set a web-page download entry for a Z-Library result.
+    """Scrape the Z-Library book page for a direct /dl/ download link.
 
-    Z-Library downloads require a user account, so we open the book's web
-    page in the user's browser rather than attempting a direct download.
-    Format information is already resolved during search from the API's
-    ``extension`` field, so no secondary API call is needed here.
+    Z-Library book pages contain an anchor whose href starts with /dl/ pointing
+    to the actual file.  We fetch that page and extract the link.
+
+    If no direct download link is found (login-gated or Cloudflare-blocked) we
+    leave s.downloads empty — Calibre will grey out the download button and the
+    user can open the book page manually via the Details icon.
     """
     if not s.formats:
         s.formats = "EPUB/PDF"
-    if s.detail_item:
-        s.downloads[s.formats] = s.detail_item
+    if not s.detail_item:
+        return
+
+    try:
+        br = browser(user_agent=USER_AGENT)
+        raw = br.open(s.detail_item, timeout=30).read()
+        soup = BeautifulSoup(raw, "html5lib")
+
+        # Z-Library direct download links: /dl/{id}/{hash}[/{filename}.ext]
+        for a in soup.find_all("a", href=re.compile(r"/dl/")):
+            href = a.get("href", "").strip()
+            if not href:
+                continue
+            full_url = href if href.startswith("http") else zlibrary_web_base + href
+            s.downloads[s.formats] = full_url
+            return
+
+        logger.info(f"Z-Library: no direct download link found on {s.detail_item}")
+    except Exception as exc:
+        logger.warning(f"Z-Library detail fetch failed: {exc}")
 
 
 # ===========================================================================
