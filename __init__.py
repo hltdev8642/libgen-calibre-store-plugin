@@ -11,9 +11,12 @@ from calibre.customize import StoreBase
 
 class LibgenStore(StoreBase):
     name = "Library Genesis"
-    version = (1, 5, 1)
-    description = "Searches for books on Library Genesis"
+    version = (2, 0, 0)
+    description = (
+        "Searches Library Genesis, Z-Library and Anna\u2019s Archive for free e-books. "
+        "Configurable mirrors and per-source toggles available in plugin preferences."
+    )
     author = "poochinski9"
     drm_free_only = True
     actual_plugin = "calibre_plugins.store_libgen.libgen_plugin:LibgenStorePlugin"
-    formats = ["EPUB", "PDF"]
+    formats = ["EPUB", "PDF", "MOBI", "AZW3", "DJVU", "FB2"]
