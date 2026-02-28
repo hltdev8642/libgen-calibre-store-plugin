@@ -235,7 +235,8 @@ def _build_libgen_result(tr):
     size = tds[size_index].text.strip()
     pages = tds[pages_index].text.strip()
     year = tds[year_index].text.strip()
-    s.price = f"{size}\n{year}" if pages == "0 pages" else f"{size}\n{pages} pages\n{year}"
+    info = f"{size} · {year}" if pages == "0 pages" else f"{size} · {pages} pages · {year}"
+    s.price = f"LibGen · {info}"
 
     s.formats = tds[ext_index].text.strip().upper()
 
@@ -372,6 +373,7 @@ def search_zlibrary(query, max_results=10, timeout=60):
                 # records (missing hash, auth-gated, or endpoint removed).
                 extension = book.get("extension", "")
                 s.formats = extension.upper() if extension else "EPUB/PDF"
+                s.price = "Z-Library"
 
                 href = book.get("href", "")
                 # href is sometimes already absolute (https://z-lib.gl/book/…);
@@ -474,8 +476,11 @@ def _parse_aa_result(div, domain):
         if fmt:
             s.formats = fmt
         price_parts = [x for x in (sz, lang) if x]
+        source_tag = "Anna's Archive"
         if price_parts:
-            s.price = " \u00b7 ".join(price_parts)
+            s.price = source_tag + " · " + " \u00b7 ".join(price_parts)
+        else:
+            s.price = source_tag
 
     # Cover image
     img = div.find("img")
